@@ -1,0 +1,11 @@
+*.o
+*.so
+*.swo
+*.swp
+Session.vim
+logfile.txt
+qemu/qemu-2.2.0
+qemu/qemu-2.2.0.tar.bz2
+vbox/VirtualBox-4.3.22
+vbox/VirtualBox-4.3.22.tar.bz2
+w7_tp.qcow2
