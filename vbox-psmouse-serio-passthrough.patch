@@ -1,0 +1,344 @@
+Index: b/src/VBox/Devices/Input/DevPS2.cpp
+===================================================================
+--- a/src/VBox/Devices/Input/DevPS2.cpp	2011-08-15 07:28:32.000000000 -0500
++++ b/src/VBox/Devices/Input/DevPS2.cpp	2011-10-07 17:22:04.000000000 -0500
+@@ -52,6 +52,11 @@
+ 
+ #include "VBoxDD.h"
+ 
++#include <iprt/env.h>
++#include <iprt/file.h>
++#include <iprt/thread.h>
++#include <iprt/semaphore.h>
++
+ #define PCKBD_SAVED_STATE_VERSION 5
+ 
+ 
+@@ -265,8 +270,19 @@
+         /** The mouse interface of the attached mouse driver. */
+         R3PTRTYPE(PPDMIMOUSECONNECTOR)      pDrv;
+     } Mouse;
++
++    /* state for mouse serio passthrough */
++    MouseCmdQueue serio_write_queue;
++    uint8_t     serio_pt_inited;
++    uint8_t 	serio_pt;
++    uint8_t 	serio_log_enabled;
++    uint8_t 	serio_reader_should_stop;
++    RTFILE      serio_fh;
++    RTFILE  	log_fh;
++    RTSEMEVENT	serio_writer_sem;
+ } KBDState;
+ 
++
+ /* Table to convert from PC scancodes to scan code set 2. */
+ static const unsigned char ps2_raw_keycode_set2[128] = {
+       0,118, 22, 30, 38, 37, 46, 54, 61, 62, 70, 69, 78, 85,102, 13,
+@@ -324,6 +340,7 @@
+             s->status |= KBD_STAT_OBF | KBD_STAT_MOUSE_OBF;
+             if (mcq->count)
+             {
++                LogRel(("SAF Data in command queue???\n"));
+                 s->dbbout = mcq->data[mcq->rptr];
+                 if (++mcq->rptr == MOUSE_CMD_QUEUE_SIZE)
+                     mcq->rptr = 0;
+@@ -336,6 +353,7 @@
+                     meq->rptr = 0;
+                 meq->count--;
+             }
++            LogRel(("SAF R %02x\n", s->dbbout));
+         }
+     }
+     /* Determine new IRQ state. */
+@@ -360,6 +378,13 @@
+     KBDQueue *q = &s->queue;
+     MouseCmdQueue *mcq = &s->mouse_command_queue;
+     MouseEventQueue *meq = &s->mouse_event_queue;
++#ifdef IN_RING3
++    if (aux != 0)
++        LogRel(("SAF Q %02x aux %d\n", b, aux));
++#else
++    if (aux != 0)
++        LogRel(("SAF X %02x aux %d\n", b, aux));
++#endif
+ 
+ #if defined(DEBUG_MOUSE) || defined(DEBUG_KBD)
+     if (aux == 1)
+@@ -724,6 +749,10 @@
+                               : RT_MIN(s->mouse_dy, 255);
+     unsigned int b;
+     unsigned fButtonsLow = s->mouse_buttons & 0x07;
++
++    if (s->serio_pt)
++        return;
++
+     s->mouse_dx -= dx1;
+     s->mouse_dy -= dy1;
+     kbd_mouse_set_reported_buttons(s, fButtonsLow, 0x07);
+@@ -742,6 +771,10 @@
+ 
+     int dz1 = s->mouse_dz < 0 ? RT_MAX(s->mouse_dz, -127)
+                               : RT_MIN(s->mouse_dz, 127);
++
++    if (s->serio_pt)
++        return;
++
+     LogRel3(("%s: dz1=%d\n", __PRETTY_FUNCTION__, dz1));
+     s->mouse_dz -= dz1;
+     kbd_queue(s, dz1 & 0xff, aux);
+@@ -753,6 +786,9 @@
+     int dz1 = 0, dw1 = 0;
+     unsigned fButtonsHigh = s->mouse_buttons & 0x18;
+ 
++    if (s->serio_pt)
++        return;
++
+     if (s->mouse_dw > 0)
+         dw1 = 1;
+     else if (s->mouse_dw < 0)
+@@ -821,6 +857,10 @@
+              __PRETTY_FUNCTION__, dx, dy, dz, dw, buttons_state));
+     KBDState *s = (KBDState*)opaque;
+ 
++    /* do nothing if in serio passthrough mode */
++    if (s->serio_pt)
++        return;
++
+     /* check if deltas are recorded when disabled */
+     if (!(s->mouse_status & MOUSE_STATUS_ENABLED))
+         return;
+@@ -851,12 +891,37 @@
+ }
+ #endif /* IN_RING3 */
+ 
++static void serio_pt_queue(KBDState *s, int val)
++{
++    MouseCmdQueue *q = &s->serio_write_queue;
++    int ret;
++
++    if (q->count >= MOUSE_CMD_QUEUE_SIZE)
++        return;
++    q->data[q->wptr] = (uint8_t)(val & 0xff);
++    if (++q->wptr == MOUSE_CMD_QUEUE_SIZE)
++        q->wptr = 0;
++    q->count++;
++
++#ifdef IN_RING3
++    ret = RTSemEventSignal(s->serio_writer_sem);
++    AssertRC(ret);
++#endif
++}
++
+ static int kbd_write_mouse(KBDState *s, int val)
+ {
+ #ifdef DEBUG_MOUSE
+     LogRelFlowFunc(("kbd: write mouse 0x%02x\n", val));
+ #endif
+     int rc = VINF_SUCCESS;
++
++    /* If in serio passthrough mode, queue data and return */
++    if (s->serio_pt) {
++        serio_pt_queue(s, val);
++        return VINF_SUCCESS;
++    }
++
+     /* Flush the mouse command response queue. */
+     s->mouse_command_queue.count = 0;
+     s->mouse_command_queue.rptr = 0;
+@@ -1077,7 +1142,8 @@
+         kbc_dbb_out(s, val);
+         break;
+     case KBD_CCMD_WRITE_AUX_OBUF:
+-        kbd_queue(s, val, 1);
++        if (!s->serio_pt)
++            kbd_queue(s, val, 1);
+         break;
+     case KBD_CCMD_WRITE_OUTPORT:
+ #ifdef TARGET_I386
+@@ -1344,6 +1410,168 @@
+ #endif /* IN_RING3 */
+ 
+ 
++/* serio passthrough support routines */
++
++#ifdef IN_RING3
++static DECLCALLBACK(int) serio_pt_read_thread(RTTHREAD self, void *data)
++{
++    KBDState *s = (KBDState *)data;
++    int ret;
++    char buf[5];
++    unsigned char byte;
++
++    while (!s->serio_reader_should_stop) {
++        ret = RTFileRead(s->serio_fh, &byte, 1, NULL);
++        if (!RT_SUCCESS(ret)) {
++            LogRel(("SAF Error reading from serio mouse device\n"));
++            break;
++        }
++
++        /*
++         * Mouse event and command data separated into two queues. We don't
++         * differentiate, just shove the data into the queue as it comes.
++         * Use event queue because it's bigger.
++         */
++        kbd_queue(s, byte, 2);
++
++        if (s->serio_log_enabled) {
++            unsigned int temp;
++            buf[0] = 'R';
++            buf[1] = ' ';
++            temp = (byte & 0xf0) >> 4;
++            buf[2] = (temp < 10) ? '0' + temp : 'a' + temp - 10;
++            temp = byte & 0x0f;
++            buf[3] = (temp < 10) ? '0' + temp : 'a' + temp - 10;
++            buf[4] = '\n';
++            RTFileWrite(s->log_fh, buf, 5, NULL);
++        }
++    }
++
++    return VINF_SUCCESS;
++}
++
++static DECLCALLBACK(int) serio_pt_write_thread(RTTHREAD self, void *data)
++{
++    KBDState *s = (KBDState *)data;
++    MouseCmdQueue *q = &s->serio_write_queue;
++    int ret;
++    char buf[5];
++    uint8_t byte;
++
++    while (!s->serio_reader_should_stop) {
++        ret = RTSemEventWait(s->serio_writer_sem, 5);
++        if (RT_UNLIKELY(ret == VERR_INTERRUPTED))
++            continue;
++        if (ret != VERR_TIMEOUT && RT_FAILURE(ret))
++            break;
++
++        while (q->count != 0) {
++            byte = q->data[q->rptr];
++            q->data[q->rptr] = 0;
++            if (++q->rptr == MOUSE_CMD_QUEUE_SIZE)
++                q->rptr = 0;
++            q->count--;
++
++            /* Seeing some odd data, just ignore it. May be due to races. */
++            if (byte < 0x80)
++                continue;
++
++            RTFileWrite(s->serio_fh, &byte, 1, NULL);
++
++            LogRel(("SAF S %02x\n", (unsigned)byte));
++            if (s->serio_log_enabled) {
++                unsigned int temp;
++                buf[0] = 'S';
++                buf[1] = ' ';
++                temp = (byte & 0xf0) >> 4;
++                buf[2] = (temp < 10) ? '0' + temp : 'a' + temp - 10;
++                temp = byte & 0x0f;
++                buf[3] = (temp < 10) ? '0' + temp : 'a' + temp - 10;
++                buf[4] = '\n';
++                RTFileWrite(s->log_fh, buf, 5, NULL);
++            }
++        }
++    }
++
++    return VINF_SUCCESS;
++}
++#endif /* IN_RING3 */
++
++static void serio_pt_init(KBDState *s)
++{
++#ifndef IN_RING3
++    return;
++#else
++    const char *serio_dev_path;
++    const char *serio_log_path;
++    int ret;
++
++LogRel(("SAF: serio_pt_init"));
++    if (s->serio_pt_inited)
++        return;
++    s->serio_pt_inited = 1;
++
++    s->serio_log_enabled = 0;
++    s->serio_writer_sem = NIL_RTSEMEVENT;
++
++    serio_dev_path = RTEnvGet("PSMOUSE_SERIO_DEV_PATH");
++    if (!serio_dev_path) {
++        LogRel(("SAF No serio device specified in environment\n"));
++        return;
++    }
++
++    ret = RTFileOpen(&s->serio_fh, serio_dev_path, RTFILE_O_READWRITE);
++    if (!RT_SUCCESS(ret)) {
++        LogRel(("SAF Open of serio device failed\n"));
++        return;
++    }
++
++LogRel(("SAF serio passthrough device opened\n"));
++    serio_log_path = RTEnvGet("PSMOUSE_SERIO_LOG_PATH");
++    if (serio_log_path) {
++        ret = RTFileOpen(&s->log_fh, serio_log_path,
++                         RTFILE_O_WRITE|RTFILE_O_APPEND|RTFILE_O_CREATE_REPLACE);
++        if (!RT_SUCCESS(ret))
++            LogRel(("SAF Waring: Could not open log file %s\n", serio_log_path));
++        else
++            s->serio_log_enabled = 1;
++    }
++
++    ret = RTSemEventCreate(&s->serio_writer_sem);
++    if (!RT_SUCCESS(ret)) {
++        LogRel(("SAF Error creating writer semaphore\n"));
++        goto cleanup;
++    }
++
++    s->serio_reader_should_stop = 0;
++
++    ret = RTThreadCreate(NULL, serio_pt_read_thread, (void *)s, 0,
++                         RTTHREADTYPE_IO, 0, "serio_reader");
++    if (!RT_SUCCESS(ret)) {
++        LogRel(("SAF Error creating serio reader thread\n"));
++        goto cleanup;
++    }
++
++    ret = RTThreadCreate(NULL, serio_pt_write_thread, (void *)s, 0,
++                         RTTHREADTYPE_IO, 0, "serio_writer");
++    if (!RT_SUCCESS(ret)) {
++        LogRel(("SAF Error creating serio writer thread\n"));
++        goto cleanup;
++    }
++
++LogRel(("SAF: serio pt init successful\n"));
++    s->serio_pt = 1;
++    return;
++
++cleanup:
++    if (s->serio_log_enabled)
++        RTFileClose(s->log_fh);
++    LogRel(("SAF Mouse support will be completely broken\n"));
++    RTFileClose(s->serio_fh);
++#endif /* IN_RING3 */
++}
++
++
+ /* VirtualBox code start */
+ 
+ /* -=-=-=-=-=- wrappers -=-=-=-=-=- */
+@@ -1660,7 +1888,7 @@
+             }
+             else if (rc == VERR_PDM_NO_ATTACHED_DRIVER)
+             {
+-                Log(("%s/%d: warning: no driver attached to LUN #1!\n", pDevIns->pReg->szName, pDevIns->iInstance));
++                LogRel(("%s/%d: warning: no driver attached to LUN #1!\n", pDevIns->pReg->szName, pDevIns->iInstance));
+                 rc = VINF_SUCCESS;
+             }
+             else
+@@ -1787,6 +2015,8 @@
+     pThis->Mouse.IPort.pfnPutEvent          = kbdMousePutEvent;
+     pThis->Mouse.IPort.pfnPutEventAbs       = kbdMousePutEventAbs;
+ 
++    serio_pt_init(pThis);
++
+     /*
+      * Initialize the critical section.
+      */
