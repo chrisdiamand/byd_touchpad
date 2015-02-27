@@ -3,6 +3,7 @@
 *.swo
 *.swp
 Session.vim
+drv/drv
 logfile.txt
 qemu/qemu-2.2.0
 qemu/qemu-2.2.0.tar.bz2
