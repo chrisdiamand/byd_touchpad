@@ -1,40 +1,36 @@
 Index: b/src/VBox/Devices/Input/DevPS2.cpp
 ===================================================================
---- a/src/VBox/Devices/Input/DevPS2.cpp	2011-08-15 07:28:32.000000000 -0500
-+++ b/src/VBox/Devices/Input/DevPS2.cpp	2011-10-07 17:22:04.000000000 -0500
-@@ -52,6 +52,11 @@
- 
- #include "VBoxDD.h"
- 
+--- a/src/VBox/Devices/Input/DevPS2.cpp	2015-02-12 16:10:24.000000000 +0000
++++ b/src/VBox/Devices/Input/DevPS2.cpp	2015-02-26 13:44:10.713735933 +0000
+@@ -49,6 +49,10 @@
+ #include <VBox/vmm/pdmdev.h>
+ #include <iprt/assert.h>
+ #include <iprt/uuid.h>
 +#include <iprt/env.h>
 +#include <iprt/file.h>
 +#include <iprt/thread.h>
 +#include <iprt/semaphore.h>
-+
- #define PCKBD_SAVED_STATE_VERSION 5
  
- 
-@@ -265,8 +270,19 @@
-         /** The mouse interface of the attached mouse driver. */
+ #include "VBoxDD.h"
+ #include "PS2Dev.h"
+@@ -254,6 +258,16 @@
          R3PTRTYPE(PPDMIMOUSECONNECTOR)      pDrv;
      } Mouse;
+ #endif
 +
 +    /* state for mouse serio passthrough */
 +    MouseCmdQueue serio_write_queue;
 +    uint8_t     serio_pt_inited;
-+    uint8_t 	serio_pt;
-+    uint8_t 	serio_log_enabled;
-+    uint8_t 	serio_reader_should_stop;
++    uint8_t     serio_pt;
++    uint8_t     serio_log_enabled;
++    uint8_t     serio_reader_should_stop;
 +    RTFILE      serio_fh;
-+    RTFILE  	log_fh;
-+    RTSEMEVENT	serio_writer_sem;
++    RTFILE      log_fh;
++    RTSEMEVENT  serio_writer_sem;
  } KBDState;
  
-+
- /* Table to convert from PC scancodes to scan code set 2. */
- static const unsigned char ps2_raw_keycode_set2[128] = {
-       0,118, 22, 30, 38, 37, 46, 54, 61, 62, 70, 69, 78, 85,102, 13,
-@@ -324,6 +340,7 @@
+ #ifndef VBOX_DEVICE_STRUCT_TESTCASE
+@@ -320,6 +334,7 @@
              s->status |= KBD_STAT_OBF | KBD_STAT_MOUSE_OBF;
              if (mcq->count)
              {
@@ -42,16 +38,16 @@ Index: b/src/VBox/Devices/Input/DevPS2.cpp
                  s->dbbout = mcq->data[mcq->rptr];
                  if (++mcq->rptr == MOUSE_CMD_QUEUE_SIZE)
                      mcq->rptr = 0;
-@@ -336,6 +353,7 @@
+@@ -332,6 +347,7 @@
                      meq->rptr = 0;
                  meq->count--;
              }
 +            LogRel(("SAF R %02x\n", s->dbbout));
          }
+ #endif
      }
-     /* Determine new IRQ state. */
-@@ -360,6 +378,13 @@
-     KBDQueue *q = &s->queue;
+@@ -363,6 +379,13 @@
+ {
      MouseCmdQueue *mcq = &s->mouse_command_queue;
      MouseEventQueue *meq = &s->mouse_event_queue;
 +#ifdef IN_RING3
@@ -64,7 +60,7 @@ Index: b/src/VBox/Devices/Input/DevPS2.cpp
  
  #if defined(DEBUG_MOUSE) || defined(DEBUG_KBD)
      if (aux == 1)
-@@ -724,6 +749,10 @@
+@@ -631,6 +654,10 @@
                                : RT_MIN(s->mouse_dy, 255);
      unsigned int b;
      unsigned fButtonsLow = s->mouse_buttons & 0x07;
@@ -75,7 +71,7 @@ Index: b/src/VBox/Devices/Input/DevPS2.cpp
      s->mouse_dx -= dx1;
      s->mouse_dy -= dy1;
      kbd_mouse_set_reported_buttons(s, fButtonsLow, 0x07);
-@@ -742,6 +771,10 @@
+@@ -649,6 +676,10 @@
  
      int dz1 = s->mouse_dz < 0 ? RT_MAX(s->mouse_dz, -127)
                                : RT_MIN(s->mouse_dz, 127);
@@ -86,7 +82,7 @@ Index: b/src/VBox/Devices/Input/DevPS2.cpp
      LogRel3(("%s: dz1=%d\n", __PRETTY_FUNCTION__, dz1));
      s->mouse_dz -= dz1;
      kbd_queue(s, dz1 & 0xff, aux);
-@@ -753,6 +786,9 @@
+@@ -660,6 +691,9 @@
      int dz1 = 0, dw1 = 0;
      unsigned fButtonsHigh = s->mouse_buttons & 0x18;
  
@@ -96,7 +92,7 @@ Index: b/src/VBox/Devices/Input/DevPS2.cpp
      if (s->mouse_dw > 0)
          dw1 = 1;
      else if (s->mouse_dw < 0)
-@@ -821,6 +857,10 @@
+@@ -729,6 +763,10 @@
               __PRETTY_FUNCTION__, dx, dy, dz, dw, buttons_state));
      KBDState *s = (KBDState*)opaque;
  
@@ -107,8 +103,8 @@ Index: b/src/VBox/Devices/Input/DevPS2.cpp
      /* check if deltas are recorded when disabled */
      if (!(s->mouse_status & MOUSE_STATUS_ENABLED))
          return;
-@@ -851,12 +891,37 @@
- }
+@@ -761,12 +799,37 @@
+ 
  #endif /* IN_RING3 */
  
 +static void serio_pt_queue(KBDState *s, int val)
@@ -145,17 +141,17 @@ Index: b/src/VBox/Devices/Input/DevPS2.cpp
      /* Flush the mouse command response queue. */
      s->mouse_command_queue.count = 0;
      s->mouse_command_queue.rptr = 0;
-@@ -1077,7 +1142,8 @@
+@@ -991,7 +1054,8 @@
          kbc_dbb_out(s, val);
          break;
      case KBD_CCMD_WRITE_AUX_OBUF:
--        kbd_queue(s, val, 1);
+-        kbc_dbb_out_aux(s, val);
 +        if (!s->serio_pt)
-+            kbd_queue(s, val, 1);
++            kbc_dbb_out_aux(s, val);
          break;
      case KBD_CCMD_WRITE_OUTPORT:
  #ifdef TARGET_I386
-@@ -1344,6 +1410,168 @@
+@@ -1271,6 +1335,168 @@
  #endif /* IN_RING3 */
  
  
@@ -324,7 +320,7 @@ Index: b/src/VBox/Devices/Input/DevPS2.cpp
  /* VirtualBox code start */
  
  /* -=-=-=-=-=- wrappers -=-=-=-=-=- */
-@@ -1660,7 +1888,7 @@
+@@ -1565,7 +1791,7 @@
              }
              else if (rc == VERR_PDM_NO_ATTACHED_DRIVER)
              {
@@ -333,12 +329,12 @@ Index: b/src/VBox/Devices/Input/DevPS2.cpp
                  rc = VINF_SUCCESS;
              }
              else
-@@ -1787,6 +2015,8 @@
-     pThis->Mouse.IPort.pfnPutEvent          = kbdMousePutEvent;
-     pThis->Mouse.IPort.pfnPutEventAbs       = kbdMousePutEventAbs;
+@@ -1692,6 +1918,8 @@
+     pThis->Mouse.IPort.pfnPutEventMultiTouch = kbdMousePutEventMultiTouch;
+ #endif
  
 +    serio_pt_init(pThis);
 +
      /*
-      * Initialize the critical section.
+      * Register I/O ports, save state, keyboard event handler and mouse event handlers.
       */
