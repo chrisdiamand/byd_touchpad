@@ -1,7 +1,7 @@
 Index: b/hw/ps2.c
 ===================================================================
---- a/hw/ps2.c	2011-09-28 10:21:24.000000000 -0500
-+++ b/hw/ps2.c	2011-11-18 00:18:11.995530519 -0600
+--- a/hw/input/ps2.c	(revision )
++++ b/hw/input/ps2.c	(working copy)
 @@ -21,6 +21,18 @@
   * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
   * THE SOFTWARE.
@@ -18,13 +18,14 @@ Index: b/hw/ps2.c
 +#include <poll.h>
 +#include <pthread.h>
 +
- #include "hw.h"
- #include "ps2.h"
- #include "console.h"
-@@ -106,6 +118,13 @@
+ #include "hw/hw.h"
+ #include "hw/input/ps2.h"
+ #include "ui/console.h"
+@@ -111,6 +123,14 @@
      int mouse_dy;
      int mouse_dz;
      uint8_t mouse_buttons;
++
 +    int serio_pt;
 +    const char *serio_dev_path;
 +    const char *serio_log_path;
@@ -35,11 +36,10 @@ Index: b/hw/ps2.c
  } PS2MouseState;
  
  /* Table to convert from PC scancodes to raw scancodes.  */
-@@ -134,6 +153,117 @@
-     s->update_irq(s->update_arg, 1);
- }
+@@ -135,6 +155,115 @@
+  19,  25,  57,  81,  83,  92,  95,  98,  99, 100, 101, 103, 104, 106, 109, 110
+ };
  
-+
 +/*
 + * Serio passthrough support
 + */
@@ -149,30 +149,29 @@ Index: b/hw/ps2.c
 +    s->serio_fd = -1;
 +}
 +
-+
- /*
-    keycode is expressed as follow:
-    bit 7    - 0 key pressed, 1 = key released
-@@ -334,6 +464,10 @@
+ void ps2_queue(void *opaque, int b)
  {
-     PS2MouseState *s = opaque;
+     PS2State *s = (PS2State *)opaque;
+@@ -380,6 +509,9 @@
+     };
+     PS2MouseState *s = (PS2MouseState *)dev;
  
-+    /* do nothing if in serio passthrough mode */
 +    if (s->serio_pt)
 +        return;
 +
      /* check if deltas are recorded when disabled */
      if (!(s->mouse_status & MOUSE_STATUS_ENABLED))
          return;
-@@ -367,6 +501,19 @@
+@@ -440,6 +572,20 @@
  void ps2_write_mouse(void *opaque, int val)
  {
      PS2MouseState *s = (PS2MouseState *)opaque;
-+    unsigned char byte = (unsigned char)(val & 0xff);
-+    int ret;
-+    char buf[16];
 +
 +    if (s->serio_pt) {
++        unsigned char byte = (unsigned char)(val & 0xff);
++        int ret;
++        char buf[16];
++
 +        ret = write(s->serio_fd, &byte, 1);
 +        if (s->log_fd > -1) {
 +            ret = sprintf(buf, "S %02hhx\n", byte);
@@ -184,12 +183,11 @@ Index: b/hw/ps2.c
  #ifdef DEBUG_MOUSE
      printf("kbd: write mouse 0x%02x\n", val);
  #endif
-@@ -605,6 +752,10 @@
+@@ -784,6 +930,9 @@
  {
-     PS2MouseState *s = (PS2MouseState *)qemu_mallocz(sizeof(PS2MouseState));
+     PS2MouseState *s = (PS2MouseState *)g_malloc0(sizeof(PS2MouseState));
  
 +    error_report("ps2 mouse init\n");
-+
 +    serio_pt_init(s);
 +
      s->common.update_irq = update_irq;
