@@ -53,6 +53,24 @@ uint8_t read_byte(int fd) {
     return c;
 }
 
+const char *interpret_scroll(uint8_t scroll) {
+    switch (scroll) {
+        case 0xCA:      return "scrollup";
+        case 0x36:      return "scrolldown";
+        case 0x2B:      return "2down";
+        case 0xD5:      return "2up";
+        case 0xD6:      return "2left";
+        case 0x2A:      return "2right";
+        case 0xD8:      return "zoomout";
+        case 0x28:      return "zoomin";
+        case 0xD3:      return "3up";
+        case 0x2D:      return "3down";
+        case 0xD4:      return "3left";
+        case 0x2C:      return "3right";
+    }
+    return "_";
+}
+
 void read_ps2_packet(int fd) {
     uint8_t pkt[4];
     pkt[0] = read_byte(fd);
@@ -70,11 +88,12 @@ void read_ps2_packet(int fd) {
         //b1 = pkt[0] = ps2_align(fd);
     }
 
-    printf("%02x %02x %02x %02x ", pkt[0], pkt[1], pkt[2], pkt[3]);
+    printf("%02x %03d %03d %02x ", pkt[0], pkt[1], pkt[2], pkt[3]);
 
-    printf("%s %s %s\n", b1 & PS2_LEFT   ? "left" : "_",
-                         b1 & PS2_MIDDLE ? "middle" : "_",
-                         b1 & PS2_RIGHT  ? "right" : "_");
+    printf("%s %s %s : ", b1 & PS2_LEFT   ? "left" : "_",
+                          b1 & PS2_MIDDLE ? "middle" : "_",
+                          b1 & PS2_RIGHT  ? "right" : "_");
+    printf("%s\n", interpret_scroll(pkt[3]));
 }
 
 void wait_byte(int fd, uint8_t byte) {
@@ -89,7 +108,9 @@ void wait_byte(int fd, uint8_t byte) {
 }
 
 void ps2_wait_ack(int fd) {
+    printf("Waiting for ACK...");
     wait_byte(fd, PS2_ACK);
+    printf("done.\n");
 }
 
 void send_byte(int fd, uint8_t byte) {
@@ -107,7 +128,9 @@ void ps2_get_status(int fd) {
     send_byte(fd, 0xE9);
     ps2_wait_ack(fd);
     uint8_t stat[3];
-    read(fd, stat, 3);
+    stat[0] = read_byte(fd);
+    stat[1] = read_byte(fd);
+    stat[2] = read_byte(fd);
     printf("status: %02x %02x %02x\n", stat[0], stat[1], stat[2]);
 }
 
@@ -175,13 +198,52 @@ void ps2_init(int fd) {
     printf("Streaming enabled.\n");
 }
 
+// Send a sequence of bytes - each one should be ACKed before the next is sent.
+static void send_seq(int fd, const uint8_t *seq, size_t len) {
+    for (unsigned i = 0; i < len; ++i) {
+        send_byte(fd, seq[i]);
+        ps2_wait_ack(fd);
+    }
+}
+
+void tp_init(int fd) {
+    const uint8_t seq1[] = {0xE2, 0x00, 0xE0, 0x02, 0xE0};
+    send_seq(fd, seq1, sizeof(seq1) / sizeof(*seq1));
+
+    send_byte(fd, 0x01);
+    ps2_wait_ack(fd);
+    printf("R0x01: %02x\n", read_byte(fd));
+    printf("R0x01: %02x\n", read_byte(fd));
+    printf("R0x01: %02x\n", read_byte(fd));
+    printf("R0x01: %02x\n", read_byte(fd));
+
+    const uint8_t seq2[] = { 0xD3, 0x01, 0xD0, 0x00, 0xD0, 0x04, 0xD4, 0x01,
+    0xD5, 0x01, 0xD7, 0x03, 0xD8, 0x04, 0xDA, 0x03, 0xDB, 0x02, 0xE4, 0x05,
+    0xD6, 0x01, 0xDE, 0x04, 0xE3, 0x01, 0xCF, 0x00, 0xD2, 0x03, 0xE5, 0x04,
+    0xD9, 0x02, 0xD9, 0x07, 0xDC, 0x03, 0xDD, 0x03, 0xDF, 0x03, 0xE1, 0x03,
+    0xD1, 0x00, 0xCE, 0x00, 0xCC, 0x00, 0xE0, 0x00, 0xE2, 0x01 };
+
+    send_seq(fd, seq2, sizeof(seq2) / sizeof(*seq2));
+}
+
 int main(int argc, char **argv) {
     int fd = open_serio();
 
+    /*send_byte(fd, 0xE2);
+    send_byte(fd, 0x00);
+    ps2_wait_ack(fd);
+    */
+
     ps2_init(fd);
+    printf("    --- Changing mode ---\n");
+    tp_init(fd);
+
+    printf("Reading\n");
 
     while (true) {
         read_ps2_packet(fd);
+        //uint8_t c = read_byte(fd);
+        //printf("R: %02x = %d\n", c, c);
     }
 
     return 0;
